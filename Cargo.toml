@@ -1,0 +1,10 @@
+[package]
+name = "gaussian-splat"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytemuck = { version = "1.16.1", features = ["derive"] }
+image = "0.25.1"
+rand = "0.8"
+
