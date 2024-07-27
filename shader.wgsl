@@ -11,7 +11,7 @@ const TAU: f32 = 6.283185307179586;
 fn gaussian(p: vec2<f32>, c: vec2<f32>, r: vec2<f32>, a: f32) -> f32 {
 	var p1 = p - c;
 
-	let an = a * (TAU / 256.0);
+	let an = a * TAU / 256.0;
 	let co = cos(an);
 	let si = sin(an);
 	p1 = mat2x2<f32>(co, -si, si, co) * p1;
@@ -37,9 +37,9 @@ fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> @builtin(position) ve
 // A fragment shader that draws the ellipses
 @fragment
 fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
-	let p = position.xy * 256.0 + 256.0;
+	let p = vec2<f32>(position.x, 512.0 - position.y);
 
-	var col: vec3<f32> = vec3<f32>(1.0, 1.0, 1.0);
+	var col: vec3<f32> = vec3<f32>(255.0);
 
 	for (var i = 0u; i < 500; i++) {
 		let whag = ellipses[i * 2];
@@ -61,7 +61,11 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
 		col = mix(col, vec3<f32>(r, g, b), f);
 	}
 
-	return vec4<f32>(p / 262144.0, 1.0, 1.0);
+	if (abs(p.x - 256.0) > 255.0) {
+		col = vec3<f32>(0.0);
+	}
+
+	return vec4<f32>(col / 255.0, 1.0);
 }
 
 @group(0) @binding(2)
@@ -79,12 +83,14 @@ var<storage, read_write> similarity: atomic<u32>;
 // This shader is called once per 16x16 block of pixels in the image.
 
 @compute
-@workgroup_size(16, 16, 1)
+@workgroup_size(1, 1, 1)
 fn cs_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+	let tl = global_id.xy * 16u;
+
 	// check all the way to global_id.x + 16 and global_id.y + 16
 	// it is assumed the image is a multiple of 16x16
-	for (var x = global_id.x; x < 16; x++) {
-		for (var y = global_id.y; y < 16; y++) {
+	for (var x = tl.x; x < 16 + tl.x; x++) {
+		for (var y = tl.y; y < 16 + tl.y; y++) {
 			let source = vec4<i32>(textureLoad(t_source, vec2<u32>(x, y), 0) * 255.0);
 			let current = vec4<i32>(textureLoad(t_current, vec2<u32>(x, y), 0) * 255.0);
 
