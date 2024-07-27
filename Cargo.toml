@@ -11,5 +11,5 @@ image = "0.25.1"
 pollster = "0.3.0"
 rand = "0.8"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
-wgpu = "0.20.1"
+wgpu = "22.0.0"
 
