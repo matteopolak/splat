@@ -21,7 +21,7 @@ pub struct Pipeline {
 	/// image rendered by the fragment shader.
 	difference: wgpu::Buffer,
 	difference_staging: wgpu::Buffer,
-	lowest_difference: u32,
+	lowest_difference: Difference,
 
 	bind_group: wgpu::BindGroup,
 	rng: rand::rngs::ThreadRng,
@@ -29,12 +29,54 @@ pub struct Pipeline {
 	debug_buffer: wgpu::Buffer,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct Difference(pub u32);
+
+impl Difference {
+	pub fn splat(self, rng: &mut rand::rngs::ThreadRng) -> [u8; 8] {
+		let mut bytes = [0u8; 8];
+		rng.fill_bytes(&mut bytes);
+		let stage = self.stage();
+
+		bytes.map(|b| b >> stage)
+	}
+
+	/// Returns the "stage", which approaches 7 as the difference
+	/// reaches 0, and 0 as it reaches `WIDTH * HEIGHT * 3 * 255`.
+	///
+	/// It should be approximately logarithmic, but not exactly.
+	pub fn stage(self) -> u8 {
+		const MAX_INPUT: u32 = Pipeline::WIDTH as u32 * Pipeline::HEIGHT as u32 * 3 * 255;
+		const MIN_INPUT: u32 = MAX_INPUT / 64;
+		const BREAK_POINT: u32 = MAX_INPUT / 4;
+
+		const MAX_OUTPUT: u8 = 3;
+		const MIN_OUTPUT: u8 = 0;
+
+		if self.0 >= BREAK_POINT {
+			return 0;
+		}
+
+		// Ensure x is within the expected range
+		let x = self.0.min(MIN_INPUT);
+
+		// Calculate the logarithmic scale factor
+		let scale_factor = (BREAK_POINT - MIN_INPUT) as f64 / (MAX_OUTPUT as f64).ln();
+
+		// Apply the logarithmic transformation
+		let log_value = (MAX_OUTPUT as f64 * (1.0 - (x as f64 / scale_factor).ln())).max(0.0);
+
+		// Convert the result to u32
+		(log_value.round() as u8 * 3 / 5).clamp(MIN_OUTPUT, MAX_OUTPUT)
+	}
+}
+
 impl Pipeline {
 	pub const HEIGHT: usize = 512;
 	pub const WIDTH: usize = 512;
 
 	pub fn difference(&self) -> u32 {
-		self.lowest_difference
+		self.lowest_difference.0
 	}
 
 	pub fn solution(&self) -> &[u8] {
@@ -45,23 +87,26 @@ impl Pipeline {
 	///
 	/// The image must be a [`Self::HEIGHT`] x [`Self::WIDTH`] image in RGBA
 	/// format.
-	pub async fn new(image: &[u8]) -> Option<Self> {
-		// let mut splats: [u8; 4000] =
-		// bytemuck::cast_slice(&crate::DATA).try_into().unwrap(); //[0u8; 500 * 8];
-		let mut splats = vec![0u8; 500 * 8];
+	pub async fn new(image: &[u8], splats: Option<[u8; 4000]>) -> Option<Self> {
 		let mut rng = rand::thread_rng();
-		rng.fill_bytes(&mut splats);
+		let splats = if let Some(splats) = splats {
+			splats
+		} else {
+			let mut splats = [0u8; 500 * 8];
+			rng.fill_bytes(&mut splats);
+			splats
+		};
 
 		let (device, queue) = create_device_queue().await.unwrap();
 
 		let module = device.create_shader_module(wgpu::include_wgsl!("../shader.wgsl"));
 
-		let target = create_target_texture(&device, &queue, image).await;
-		let (current, current_for_compute) = create_render_textures(&device, &queue, image).await;
+		let target = create_target_texture(&device, &queue, image);
+		let (current, current_for_compute) = create_render_textures(&device, &queue, image);
 
-		let splat_buffer = create_splat_buffer(&device, &splats).await;
+		let splat_buffer = create_splat_buffer(&device, &splats);
 
-		let (difference, difference_staging) = create_difference_buffer(&device).await;
+		let (difference, difference_staging) = create_difference_buffer(&device);
 
 		let layout = bind_group_layout(&device);
 		let group = bind_group(
@@ -94,25 +139,15 @@ impl Pipeline {
 			splat_buffer,
 			difference,
 			difference_staging,
-			lowest_difference: u32::MAX,
+			lowest_difference: Difference(u32::MAX),
 			bind_group: group,
 			rng,
 			debug_buffer,
 		})
 	}
 
-	/// Runs one pass and returns the difference
-	pub async fn pass(&mut self) {
-		let splat = self.rng.gen_range(0..500);
-		let offset = (splat * 8) as wgpu::BufferAddress;
-
-		let random_splat = self.rng.gen::<[u8; 8]>();
-
-		// write to some splats
-		self
-			.queue
-			.write_buffer(&self.splat_buffer, offset, &random_splat);
-
+	/// Renders the current splats to the image texture.
+	pub fn render(&self) {
 		// first, render to texture
 		let mut encoder = self
 			.device
@@ -170,6 +205,34 @@ impl Pipeline {
 			.device
 			.poll(wgpu::Maintain::wait_for(index))
 			.panic_on_timeout();
+	}
+
+	/// Runs one pass and returns the difference
+	pub async fn pass(&mut self) {
+		let splat = self.rng.gen_range(0..500);
+		let offset = (splat * 8) as wgpu::BufferAddress;
+
+		// generate random bytes. we will use the current difference
+		// to determine how much to nudge by (this doesn't "overwrite",
+		// but rather "nudges" the current splat)
+		let mut splat_nudge = self.lowest_difference.splat(&mut self.rng);
+		let random_splat = {
+			let base_splat = &self.splats[offset as usize..offset as usize + 8];
+
+			for i in 0..8 {
+				splat_nudge[i] = splat_nudge[i].wrapping_add(base_splat[i]);
+			}
+
+			splat_nudge
+		};
+
+		// write to some splats
+		self
+			.queue
+			.write_buffer(&self.splat_buffer, offset, &random_splat);
+
+		// render the current splats
+		self.render();
 
 		// reset the difference counter
 		self
@@ -228,7 +291,7 @@ impl Pipeline {
 
 		// if the new difference is strictly worse, copy the best splat to the
 		// one we just tried
-		if difference > self.lowest_difference {
+		if difference > self.lowest_difference.0 {
 			self.queue.write_buffer(
 				&self.splat_buffer,
 				offset,
@@ -239,79 +302,79 @@ impl Pipeline {
 			// determined was better
 			self.splats[offset as usize..offset as usize + 8].copy_from_slice(&random_splat);
 
-			if difference == self.lowest_difference {
+			if difference == self.lowest_difference.0 {
 				return;
 			}
 
 			tracing::info!(
 				"improved difference from {} to {}",
-				self.lowest_difference,
+				self.lowest_difference.0,
 				difference
 			);
 
-			self.lowest_difference = difference;
+			self.lowest_difference.0 = difference;
 
-			let mut encoder = self
-				.device
-				.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+			self.render_to_image().await.save("debug.png").unwrap();
+		}
+	}
 
-			encoder.copy_texture_to_buffer(
-				wgpu::ImageCopyTexture {
-					texture: &self.current,
-					mip_level: 0,
-					origin: wgpu::Origin3d::ZERO,
-					aspect: wgpu::TextureAspect::All,
+	pub async fn render_to_image(&self) -> image::RgbaImage {
+		let mut encoder = self
+			.device
+			.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+		encoder.copy_texture_to_buffer(
+			wgpu::ImageCopyTexture {
+				texture: &self.current,
+				mip_level: 0,
+				origin: wgpu::Origin3d::ZERO,
+				aspect: wgpu::TextureAspect::All,
+			},
+			wgpu::ImageCopyBuffer {
+				buffer: &self.debug_buffer,
+				layout: wgpu::ImageDataLayout {
+					offset: 0,
+					bytes_per_row: Some(Self::WIDTH as u32 * 4),
+					rows_per_image: Some(Self::HEIGHT as u32),
 				},
-				wgpu::ImageCopyBuffer {
-					buffer: &self.debug_buffer,
-					layout: wgpu::ImageDataLayout {
-						offset: 0,
-						bytes_per_row: Some(Self::WIDTH as u32 * 4),
-						rows_per_image: Some(Self::HEIGHT as u32),
-					},
-				},
-				wgpu::Extent3d {
-					width: Self::WIDTH as u32,
-					height: Self::HEIGHT as u32,
-					depth_or_array_layers: 1,
-				},
-			);
+			},
+			wgpu::Extent3d {
+				width: Self::WIDTH as u32,
+				height: Self::HEIGHT as u32,
+				depth_or_array_layers: 1,
+			},
+		);
 
-			let index = self.queue.submit(Some(encoder.finish()));
+		let index = self.queue.submit(Some(encoder.finish()));
 
-			// debug the texture we wrote to to make sure it looks right
-			let buffer_slice = self.debug_buffer.slice(..);
+		// debug the texture we wrote to to make sure it looks right
+		let buffer_slice = self.debug_buffer.slice(..);
 
-			let (sender, receiver) = flume::bounded(1);
+		let (sender, receiver) = flume::bounded(1);
 
-			buffer_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
+		buffer_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
 
-			self
-				.device
-				.poll(wgpu::Maintain::wait_for(index))
-				.panic_on_timeout();
+		self
+			.device
+			.poll(wgpu::Maintain::wait_for(index))
+			.panic_on_timeout();
 
-			// Awaits until `buffer_future` can be read from
-			if let Ok(Ok(())) = receiver.recv_async().await {
-				// Gets contents of buffer
-				let data = buffer_slice.get_mapped_range();
-				let result: &[u8] = &data;
+		// Awaits until `buffer_future` can be read from
+		if let Ok(Ok(())) = receiver.recv_async().await {
+			// Gets contents of buffer
+			let data = buffer_slice.get_mapped_range();
+			let result: &[u8] = &data;
 
-				// write to debug.png
-				image::save_buffer(
-					"debug.png",
-					result,
-					Self::WIDTH as u32,
-					Self::HEIGHT as u32,
-					image::ColorType::Rgba8,
-				)
-				.unwrap();
+			let image =
+				image::RgbaImage::from_raw(Self::WIDTH as u32, Self::HEIGHT as u32, result.to_vec())
+					.unwrap();
 
-				drop(data);
-				self.debug_buffer.unmap();
-			} else {
-				panic!("failed to run fragment on gpu!")
-			}
+			drop(data);
+			self.debug_buffer.unmap();
+
+			image
+		} else {
+			panic!("failed to run fragment on gpu!")
 		}
 	}
 }
@@ -468,7 +531,7 @@ fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 /// Creates the target texture that the pipeline will try to match.
 ///
 /// This will never be modified once created.
-async fn create_target_texture(
+fn create_target_texture(
 	device: &wgpu::Device,
 	queue: &wgpu::Queue,
 	image: &[u8],
@@ -497,8 +560,9 @@ async fn create_target_texture(
 }
 
 /// Creates two textures: one for the fragment shader to draw into, and one for
-/// the compute shader to read from (with a texture_to_texture copy in between)
-async fn create_render_textures(
+/// the compute shader to read from (with a `texture_to_texture` copy in
+/// between)
+fn create_render_textures(
 	device: &wgpu::Device,
 	queue: &wgpu::Queue,
 	image: &[u8],
@@ -567,7 +631,7 @@ async fn create_device_queue() -> Option<(wgpu::Device, wgpu::Queue)> {
 	Some((device, queue))
 }
 
-async fn create_splat_buffer(device: &wgpu::Device, splats: &[u8]) -> wgpu::Buffer {
+fn create_splat_buffer(device: &wgpu::Device, splats: &[u8]) -> wgpu::Buffer {
 	device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
 		label: Some("current params buffer"),
 		contents: splats,
@@ -579,7 +643,7 @@ async fn create_splat_buffer(device: &wgpu::Device, splats: &[u8]) -> wgpu::Buff
 
 /// Constructs two buffers: one for the compute shader to write the difference
 /// into, and one for the CPU to read the difference from.
-async fn create_difference_buffer(device: &wgpu::Device) -> (wgpu::Buffer, wgpu::Buffer) {
+fn create_difference_buffer(device: &wgpu::Device) -> (wgpu::Buffer, wgpu::Buffer) {
 	// stores the difference between source and rendered image (written to by
 	// compute)
 	let difference_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
