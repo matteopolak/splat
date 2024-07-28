@@ -67,7 +67,7 @@ impl Difference {
 		let log_value = (MAX_OUTPUT as f64 * (1.0 - (x as f64 / scale_factor).ln())).max(0.0);
 
 		// Convert the result to u32
-		(log_value.round() as u8 * 3 / 5).clamp(MIN_OUTPUT, MAX_OUTPUT)
+		(log_value.round() as u8 * 4 / 5).clamp(MIN_OUTPUT, MAX_OUTPUT)
 	}
 }
 
