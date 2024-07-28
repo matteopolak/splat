@@ -77,11 +77,7 @@ var<storage, read_write> similarity: atomic<u32>;
 // A compute shader that calculates how close `t_current` is to `t_source`
 // then randomly modifies part of `ellipses` to try and get closer.
 //
-// The comparison is a regular diff of the rgb channels, then divides by the dimensions
-// of the image to get a value between 0 and 1.
-//
 // This shader is called once per 16x16 block of pixels in the image.
-
 @compute
 @workgroup_size(1, 1, 1)
 fn cs_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
