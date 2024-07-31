@@ -566,22 +566,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9fb8e00e87438d937621c1c6269e53f536c14d3fbd6a042bb24879e57d474fb5"
 
 [[package]]
-name = "gaussian-splat"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "clap",
- "flume",
- "glam",
- "image",
- "pollster",
- "rand",
- "tracing",
- "tracing-subscriber",
- "wgpu",
-]
-
-[[package]]
 name = "getrandom"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1540,6 +1524,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eda41003dc44290527a59b13432d4a0379379fa074b70174882adfbdfd917844"
 dependencies = [
  "bitflags 2.6.0",
+]
+
+[[package]]
+name = "splat"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "clap",
+ "flume",
+ "glam",
+ "image",
+ "pollster",
+ "rand",
+ "tracing",
+ "tracing-subscriber",
+ "wgpu",
 ]
 
 [[package]]

@@ -1,6 +1,10 @@
 use rand::{Rng, RngCore};
 use wgpu::util::DeviceExt;
 
+use crate::optimize::Optimizer;
+
+pub const SPLATS: usize = 1_024;
+
 pub struct Pipeline {
 	device: wgpu::Device,
 	queue: wgpu::Queue,
@@ -21,78 +25,95 @@ pub struct Pipeline {
 	/// image rendered by the fragment shader.
 	difference: wgpu::Buffer,
 	difference_staging: wgpu::Buffer,
-	lowest_difference: Difference,
 
 	bind_group: wgpu::BindGroup,
 	rng: rand::rngs::ThreadRng,
 
 	debug_buffer: wgpu::Buffer,
-}
 
-#[derive(Debug, Clone, Copy)]
-pub struct Difference(pub u32);
+	optimizer: Optimizer,
 
-impl Difference {
-	pub fn splat(self, rng: &mut rand::rngs::ThreadRng) -> [u8; 8] {
-		let mut bytes = [0u8; 8];
-		rng.fill_bytes(&mut bytes);
-		let stage = self.stage();
-
-		bytes.map(|b| b >> stage)
-	}
-
-	/// Returns the "stage", which approaches 7 as the difference
-	/// reaches 0, and 0 as it reaches `WIDTH * HEIGHT * 3 * 255`.
-	///
-	/// It should be approximately logarithmic, but not exactly.
-	pub fn stage(self) -> u8 {
-		const MAX_INPUT: u32 = Pipeline::WIDTH as u32 * Pipeline::HEIGHT as u32 * 3 * 255;
-		const MIN_INPUT: u32 = MAX_INPUT / 64;
-		const BREAK_POINT: u32 = MAX_INPUT / 4;
-
-		const MAX_OUTPUT: u8 = 3;
-		const MIN_OUTPUT: u8 = 0;
-
-		if self.0 >= BREAK_POINT {
-			return 0;
-		}
-
-		// Ensure x is within the expected range
-		let x = self.0.min(MIN_INPUT);
-
-		// Calculate the logarithmic scale factor
-		let scale_factor = (BREAK_POINT - MIN_INPUT) as f64 / (MAX_OUTPUT as f64).ln();
-
-		// Apply the logarithmic transformation
-		let log_value = (MAX_OUTPUT as f64 * (1.0 - (x as f64 / scale_factor).ln())).max(0.0);
-
-		// Convert the result to u32
-		(log_value.round() as u8 * 4 / 5).clamp(MIN_OUTPUT, MAX_OUTPUT)
-	}
+	target: wgpu::Texture,
+	target_view: wgpu::TextureView,
 }
 
 impl Pipeline {
 	pub const HEIGHT: usize = 512;
 	pub const WIDTH: usize = 512;
 
-	pub fn difference(&self) -> u32 {
-		self.lowest_difference.0
-	}
-
 	pub fn solution(&self) -> &[u8] {
 		&self.splats
+	}
+
+	#[inline]
+	pub fn difference(&self) -> u32 {
+		self.optimizer.difference()
+	}
+
+	/// Updates the target texture to a scaled version of the current image.
+	pub fn update_target_texture(&mut self) {
+		let image = self.optimizer.current();
+		let target = create_target_texture(&self.device, &self.queue, image);
+
+		let mut encoder = self
+			.device
+			.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+		encoder.copy_texture_to_texture(
+			wgpu::ImageCopyTexture {
+				texture: &target,
+				mip_level: 0,
+				origin: wgpu::Origin3d::ZERO,
+				aspect: wgpu::TextureAspect::All,
+			},
+			wgpu::ImageCopyTexture {
+				texture: &self.target,
+				mip_level: 0,
+				origin: wgpu::Origin3d::ZERO,
+				aspect: wgpu::TextureAspect::All,
+			},
+			wgpu::Extent3d {
+				width: Self::WIDTH as u32,
+				height: Self::HEIGHT as u32,
+				depth_or_array_layers: 1,
+			},
+		);
+
+		let index = self.queue.submit(Some(encoder.finish()));
+
+		println!("before");
+
+		self
+			.device
+			.poll(wgpu::Maintain::wait_for(index))
+			.panic_on_timeout();
+
+		println!("after");
+
+		self.target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+		self.target = target;
 	}
 
 	/// Constructs a pipeline used to target a certain image.
 	///
 	/// The image must be a [`Self::HEIGHT`] x [`Self::WIDTH`] image in RGBA
 	/// format.
-	pub async fn new(image: &[u8], splats: Option<[u8; 4000]>) -> Option<Self> {
+	pub async fn new(image: image::RgbaImage, splats: Option<[u8; SPLATS * 8]>) -> Option<Self> {
+		let optimizer = Optimizer::from_image(image, 32);
+
+		optimizer
+			.heatmap()
+			.to_image()
+			.save("heatmap32.png")
+			.unwrap();
+
+		optimizer.debug_flush();
+
 		let mut rng = rand::thread_rng();
 		let splats = if let Some(splats) = splats {
 			splats
 		} else {
-			let mut splats = [0u8; 500 * 8];
+			let mut splats = [0u8; SPLATS * 8];
 			rng.fill_bytes(&mut splats);
 			splats
 		};
@@ -101,8 +122,9 @@ impl Pipeline {
 
 		let module = device.create_shader_module(wgpu::include_wgsl!("../shader.wgsl"));
 
-		let target = create_target_texture(&device, &queue, image);
-		let (current, current_for_compute) = create_render_textures(&device, &queue, image);
+		let target = create_target_texture(&device, &queue, optimizer.current());
+		let (current, current_for_compute) =
+			create_render_textures(&device, &queue, optimizer.current());
 
 		let splat_buffer = create_splat_buffer(&device, &splats);
 
@@ -122,7 +144,7 @@ impl Pipeline {
 
 		let debug_buffer = device.create_buffer(&wgpu::BufferDescriptor {
 			label: None,
-			size: std::mem::size_of_val(image) as wgpu::BufferAddress,
+			size: std::mem::size_of_val(optimizer.original_bytes()) as wgpu::BufferAddress,
 			usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
 			mapped_at_creation: false,
 		});
@@ -139,10 +161,13 @@ impl Pipeline {
 			splat_buffer,
 			difference,
 			difference_staging,
-			lowest_difference: Difference(u32::MAX),
 			bind_group: group,
 			rng,
 			debug_buffer,
+			optimizer,
+
+			target_view: target.create_view(&wgpu::TextureViewDescriptor::default()),
+			target,
 		})
 	}
 
@@ -198,9 +223,6 @@ impl Pipeline {
 		// Submits command encoder for processing
 		let index = self.queue.submit(Some(encoder.finish()));
 
-		// Poll the device in a blocking manner so that our future resolves.
-		// In an actual application, `device.poll(...)` should
-		// be called in an event loop or on another thread.
 		self
 			.device
 			.poll(wgpu::Maintain::wait_for(index))
@@ -209,27 +231,17 @@ impl Pipeline {
 
 	/// Runs one pass and returns the difference
 	pub async fn pass(&mut self) {
-		let splat = self.rng.gen_range(0..500);
+		let splat = self.rng.gen_range(0..SPLATS);
 		let offset = (splat * 8) as wgpu::BufferAddress;
 
-		// generate random bytes. we will use the current difference
-		// to determine how much to nudge by (this doesn't "overwrite",
-		// but rather "nudges" the current splat)
-		let mut splat_nudge = self.lowest_difference.splat(&mut self.rng);
-		let random_splat = {
-			let base_splat = &self.splats[offset as usize..offset as usize + 8];
+		let mut splat: [u8; 8] = self.splats[offset as usize..offset as usize + 8]
+			.try_into()
+			.unwrap();
 
-			for i in 0..8 {
-				splat_nudge[i] = splat_nudge[i].wrapping_add(base_splat[i]);
-			}
-
-			splat_nudge
-		};
+		self.optimizer.transform_splat(&mut self.rng, &mut splat);
 
 		// write to some splats
-		self
-			.queue
-			.write_buffer(&self.splat_buffer, offset, &random_splat);
+		self.queue.write_buffer(&self.splat_buffer, offset, &splat);
 
 		// render the current splats
 		self.render();
@@ -289,32 +301,30 @@ impl Pipeline {
 			panic!("failed to run compute on gpu!")
 		};
 
-		// if the new difference is strictly worse, copy the best splat to the
-		// one we just tried
-		if difference > self.lowest_difference.0 {
+		let status = self.optimizer.update_difference(difference);
+
+		if status.is_improved() {
+			// otherwise, we want to update our new best params with the one we just
+			// determined was better
+			self.splats[offset as usize..offset as usize + 8].copy_from_slice(&splat);
+
+			if status.is_stagnant() {
+				return;
+			}
+
+			tracing::info!("improved difference to {difference}");
+
+			self.render_to_image().await.save("debug.png").unwrap();
+
+			if status.stage_changed() {
+				self.update_target_texture();
+			}
+		} else {
 			self.queue.write_buffer(
 				&self.splat_buffer,
 				offset,
 				&self.splats[offset as usize..offset as usize + 8],
 			);
-		} else {
-			// otherwise, we want to update our new best params with the one we just
-			// determined was better
-			self.splats[offset as usize..offset as usize + 8].copy_from_slice(&random_splat);
-
-			if difference == self.lowest_difference.0 {
-				return;
-			}
-
-			tracing::info!(
-				"improved difference from {} to {}",
-				self.lowest_difference.0,
-				difference
-			);
-
-			self.lowest_difference.0 = difference;
-
-			self.render_to_image().await.save("debug.png").unwrap();
 		}
 	}
 
@@ -547,7 +557,9 @@ fn create_target_texture(
 		sample_count: 1,
 		dimension: wgpu::TextureDimension::D2,
 		format: wgpu::TextureFormat::Rgba8Unorm,
-		usage: wgpu::TextureUsages::TEXTURE_BINDING,
+		usage: wgpu::TextureUsages::TEXTURE_BINDING
+			| wgpu::TextureUsages::COPY_DST
+			| wgpu::TextureUsages::COPY_SRC,
 		view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
 	};
 

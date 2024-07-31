@@ -41,20 +41,22 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
 
 	var col: vec3<f32> = vec3<f32>(255.0);
 
-	for (var i = 0u; i < 500; i++) {
+	for (var i = 0u; i < arrayLength(&ellipses) / 2; i++) {
 		let whag = ellipses[i * 2];
 		let xyrb = ellipses[i * 2 + 1];
 
-		let x = f32(xyrb & 511);
-		let y = f32((xyrb >> 9) & 511);
 		let w = f32(whag & 255);
 		let h = f32((whag >> 8) & 255);
 		let a = f32((whag >> 16) & 255);
 		let g = f32((whag >> 24) & 255);
-		let u = f32((xyrb >> 16) & 508);
-		let v = f32((xyrb >> 23) & 508);
-		let r = f32(clamp(g + u - 256.0, 0.0, 255.0));
-		let b = f32(clamp(g + v - 256.0, 0.0, 255.0));
+		// 0 to 8
+		let x = f32(xyrb & 511);
+		// 9 to 18
+		let y = f32((xyrb >> 9) & 511);
+		// 19 to 25 (with LSB always 0)
+		let r = f32((xyrb >> 17) & 254);
+		// 26 to 32 (with LSB always 0)
+		let b = f32((xyrb >> 24) & 254);
 
 		let f = gaussian(p, vec2<f32>(x, y), vec2<f32>(w, h), a);
 

@@ -7,6 +7,7 @@
 	clippy::default_trait_access
 )]
 
+mod optimize;
 mod pipeline;
 
 use std::path::PathBuf;
@@ -53,7 +54,7 @@ fn main() {
 	let args = Args::parse();
 
 	pollster::block_on(async {
-		let (bytes, splats) = match args {
+		let (image, splats) = match args {
 			Args::Train {
 				ref path,
 				ref checkpoint,
@@ -64,30 +65,28 @@ fn main() {
 				assert_eq!(image.width() as usize, Pipeline::WIDTH);
 				assert_eq!(image.height() as usize, Pipeline::HEIGHT);
 
-				let bytes = image.into_raw();
-
 				(
-					bytes,
+					image,
 					checkpoint.as_ref().map(|path| {
 						std::fs::read(path)
 							.expect("read checkpoint")
 							.try_into()
-							.expect("parse 4000 bytes from checkpoint")
+							.unwrap_or_else(|_| panic!("parse {} bytes from checkpoint", pipeline::SPLATS * 8))
 					}),
 				)
 			}
 			Args::Render { ref checkpoint, .. } => (
-				vec![0; Pipeline::WIDTH * Pipeline::HEIGHT * 4],
+				image::RgbaImage::new(Pipeline::WIDTH as u32, Pipeline::HEIGHT as u32),
 				Some(
 					std::fs::read(checkpoint)
 						.expect("read checkpoint")
 						.try_into()
-						.expect("parse 4000 bytes from checkpoint"),
+						.unwrap_or_else(|_| panic!("parse {} bytes from checkpoint", pipeline::SPLATS * 8)),
 				),
 			),
 		};
 
-		let mut pipeline = Pipeline::new(&bytes, splats)
+		let mut pipeline = Box::pin(Pipeline::new(image, splats))
 			.await
 			.expect("create pipeline");
 

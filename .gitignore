@@ -1,4 +1,5 @@
 /target
 *.jpg
+*.jpeg
 *.png
 *.bin
