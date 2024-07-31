@@ -3,8 +3,6 @@ use wgpu::util::DeviceExt;
 
 use crate::optimize::Optimizer;
 
-pub const SPLATS: usize = 1_024;
-
 pub struct Pipeline {
 	device: wgpu::Device,
 	queue: wgpu::Queue,
@@ -94,24 +92,29 @@ impl Pipeline {
 	///
 	/// The image must be a [`Self::HEIGHT`] x [`Self::WIDTH`] image in RGBA
 	/// format.
-	pub async fn new(image: image::RgbaImage, splats: Option<[u8; SPLATS * 8]>) -> Option<Self> {
-		let optimizer = Optimizer::from_image(image, 32);
+	pub async fn new(
+		image: image::RgbaImage,
+		num_splats: usize,
+		splats: Option<Box<[u8]>>,
+	) -> Option<Self> {
+		let optimizer = Optimizer::from_image(image);
 
-		optimizer
-			.heatmap()
-			.to_image()
-			.save("heatmap32.png")
-			.unwrap();
-
-		optimizer.debug_flush();
+		optimizer.heatmap().to_image().save("heatmap.png").unwrap();
 
 		let mut rng = rand::thread_rng();
 		let splats = if let Some(splats) = splats {
 			splats
 		} else {
-			let mut splats = [0u8; SPLATS * 8];
+			let mut splats = vec![0u8; num_splats * 8];
 			rng.fill_bytes(&mut splats);
-			splats
+
+			for i in (0..splats.len()).step_by(8) {
+				let mut splat = splats[i..i + 8].try_into().unwrap();
+				optimizer.transform_splat(&mut rng, &mut splat);
+				splats[i..i + 8].copy_from_slice(&splat);
+			}
+
+			splats.into()
 		};
 
 		let (device, queue) = create_device_queue().await.unwrap();
@@ -153,7 +156,7 @@ impl Pipeline {
 			current_view: current.create_view(&wgpu::TextureViewDescriptor::default()),
 			current,
 			current_for_compute,
-			splats: splats.into(),
+			splats,
 			splat_buffer,
 			difference,
 			difference_staging,
@@ -227,7 +230,7 @@ impl Pipeline {
 
 	/// Runs one pass and returns the difference
 	pub async fn pass(&mut self) {
-		let splat = self.rng.gen_range(0..SPLATS);
+		let splat = self.rng.gen_range(0..self.splats.len() / 8);
 		let offset = (splat * 8) as wgpu::BufferAddress;
 
 		let mut splat: [u8; 8] = self.splats[offset as usize..offset as usize + 8]
@@ -242,6 +245,44 @@ impl Pipeline {
 		// render the current splats
 		self.render();
 
+		let difference = self.compute_difference().await;
+
+		let status = self.optimizer.update_difference(difference);
+
+		if status.is_improved() || status.is_stagnant() {
+			// otherwise, we want to update our new best params with the one we just
+			// determined was better
+			self.splats[offset as usize..offset as usize + 8].copy_from_slice(&splat);
+
+			if status.is_stagnant() {
+				return;
+			}
+
+			tracing::info!(
+				stage = self.optimizer.stage().into_inner(),
+				"improved difference to {difference}"
+			);
+
+			self.render_to_image().await.save("debug.png").unwrap();
+
+			if status.stage_changed() {
+				self.update_target_texture();
+				// changing state maxes out the difference, so we need to
+				// recalculate it with the new target
+				self
+					.optimizer
+					.update_difference(self.compute_difference().await);
+			}
+		} else {
+			self.queue.write_buffer(
+				&self.splat_buffer,
+				offset,
+				&self.splats[offset as usize..offset as usize + 8],
+			);
+		}
+	}
+
+	pub async fn compute_difference(&self) -> u32 {
 		// reset the difference counter
 		self
 			.queue
@@ -281,7 +322,7 @@ impl Pipeline {
 			.panic_on_timeout();
 
 		// Awaits until `buffer_future` can be read from
-		let difference = if let Ok(Ok(())) = receiver.recv_async().await {
+		if let Ok(Ok(())) = receiver.recv_async().await {
 			// Gets contents of buffer
 			let data = buffer_slice.get_mapped_range();
 			// Since contents are got in bytes, this converts these bytes back to u32
@@ -295,32 +336,6 @@ impl Pipeline {
 			difference
 		} else {
 			panic!("failed to run compute on gpu!")
-		};
-
-		let status = self.optimizer.update_difference(difference);
-
-		if status.is_improved() {
-			// otherwise, we want to update our new best params with the one we just
-			// determined was better
-			self.splats[offset as usize..offset as usize + 8].copy_from_slice(&splat);
-
-			if status.is_stagnant() {
-				return;
-			}
-
-			tracing::info!("improved difference to {difference}");
-
-			self.render_to_image().await.save("debug.png").unwrap();
-
-			if status.stage_changed() {
-				self.update_target_texture();
-			}
-		} else {
-			self.queue.write_buffer(
-				&self.splat_buffer,
-				offset,
-				&self.splats[offset as usize..offset as usize + 8],
-			);
 		}
 	}
 

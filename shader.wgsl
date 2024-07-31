@@ -37,7 +37,7 @@ fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> @builtin(position) ve
 // A fragment shader that draws the ellipses
 @fragment
 fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
-	let p = vec2<f32>(position.x, 512.0 - position.y);
+	let p = vec2<f32>(position.x, position.y);
 
 	var col: vec3<f32> = vec3<f32>(255.0);
 
@@ -47,24 +47,20 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
 
 		let w = f32(whag & 255);
 		let h = f32((whag >> 8) & 255);
-		let a = f32((whag >> 16) & 255);
-		let g = f32((whag >> 24) & 255);
+		let a = f32((whag >> (8 + 8)) & 255);
+		let g = f32((whag >> (8 + 8 + 8)) & 255);
 		// 0 to 8
 		let x = f32(xyrb & 511);
-		// 9 to 18
+		// 9 to 17
 		let y = f32((xyrb >> 9) & 511);
-		// 19 to 25 (with LSB always 0)
-		let r = f32((xyrb >> 17) & 254);
-		// 26 to 32 (with LSB always 0)
-		let b = f32((xyrb >> 24) & 254);
+		// 18 to 24 (with LSB always 0)
+		let r = f32((xyrb >> (9 + 9 - 1)) & 254);
+		// 25 to 31 (with LSB always 0)
+		let b = f32((xyrb >> (9 + 9 + 7 - 1)) & 254);
 
 		let f = gaussian(p, vec2<f32>(x, y), vec2<f32>(w, h), a);
 
 		col = mix(col, vec3<f32>(r, g, b), f);
-	}
-
-	if (abs(p.x - 256.0) > 255.0) {
-		col = vec3<f32>(0.0);
 	}
 
 	return vec4<f32>(col / 255.0, 1.0);
