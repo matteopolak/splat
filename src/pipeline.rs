@@ -81,14 +81,10 @@ impl Pipeline {
 
 		let index = self.queue.submit(Some(encoder.finish()));
 
-		println!("before");
-
 		self
 			.device
 			.poll(wgpu::Maintain::wait_for(index))
 			.panic_on_timeout();
-
-		println!("after");
 
 		self.target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
 		self.target = target;

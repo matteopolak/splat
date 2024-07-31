@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use rand::{rngs::ThreadRng, Rng};
 
-use crate::pipeline::Pipeline;
+use crate::{model::Splat, pipeline::Pipeline};
 
 /// The current stage of the optimizer. This number is entirely
 /// based on how far the current image is to the target image.
@@ -14,6 +14,13 @@ impl Stage {
 		self.0
 	}
 
+	/// Once this returns `true`, the optimizer should stop moving
+	/// everything around randomly and instead nudge existing
+	/// parameters.
+	pub fn should_finetune(self) -> bool {
+		self.0 >= 3
+	}
+
 	/// The difference starts at around 70 million, quickly decreases
 	/// to around 40 million, then ends at around 3-5 million.
 	///
@@ -23,9 +30,9 @@ impl Stage {
 		// TODO: figure out good values for this
 		match difference {
 			..5_000_000 => Self(5),
-			5_000_000..12_000_000 => Self(4),
-			12_000_000..20_000_000 => Self(3),
-			20_000_000..30_000_000 => Self(2),
+			5_000_000..10_000_000 => Self(4),
+			10_000_000..17_000_000 => Self(3),
+			17_000_000..30_000_000 => Self(2),
 			30_000_000..40_000_000 => Self(1),
 			40_000_000.. => Self(0),
 		}
@@ -92,16 +99,47 @@ impl Optimizer {
 	/// 32            0
 	/// blue, red, y, x
 	pub fn transform_splat(&self, rng: &mut ThreadRng, splat: &mut [u8; 8]) {
-		let (x, y) = self.heatmap.weighted_pixel(rng);
-		let [red, green, blue] = self.colour_at(x, y);
+		if self.stage.should_finetune() {
+			let mut s = Splat::from_bytes(*splat);
 
-		// randomize angle, height, width
-		splat[1..4].copy_from_slice(&rng.gen::<[u8; 3]>());
-		splat[0] = green;
+			// move around the position up to 64 pixels
+			let dx = rng.gen_range(-64..=64);
+			let dy = rng.gen_range(-64..=64);
 
-		let xyrb = (blue as u32) << 24 | (red as u32) << 17 | y << 9 | x;
+			s.x = s.x.saturating_add_signed(dx).min(Pipeline::WIDTH as u16);
+			s.y = s.y.saturating_add_signed(dy).min(Pipeline::HEIGHT as u16);
 
-		splat[4..8].copy_from_slice(&xyrb.to_be_bytes());
+			// change the width and height up to 16 pixels
+			let dw = rng.gen_range(-16..=16);
+			let dh = rng.gen_range(-16..=16);
+
+			s.width = s.width.saturating_add_signed(dw);
+			s.height = s.height.saturating_add_signed(dh);
+
+			// change the angle up to 32 degrees
+			let da = rng.gen_range(-32..=32);
+
+			s.angle = s.angle.saturating_add_signed(da);
+
+			// re-calculate the colour
+			let [red, green, blue] = self.colour_at(s.x as u32, s.y as u32);
+
+			s.red = red & 0b1111_1110;
+			s.blue = blue & 0b1111_1110;
+			s.green = green;
+
+			*splat = s.to_bytes();
+		} else {
+			let (x, y) = self.heatmap.weighted_pixel(rng);
+			let [red, green, blue] = self.colour_at(x, y);
+
+			splat[1..4].copy_from_slice(&rng.gen::<[u8; 3]>());
+			splat[0] = green;
+
+			let xyrb = (blue as u32) << 24 | (red as u32) << 17 | y << 9 | x;
+
+			splat[4..8].copy_from_slice(&xyrb.to_be_bytes());
+		}
 	}
 
 	/// Iterates over every pixel, calling `colour_at` for each one

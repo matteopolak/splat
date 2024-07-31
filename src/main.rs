@@ -7,6 +7,7 @@
 	clippy::default_trait_access
 )]
 
+mod model;
 mod optimize;
 mod pipeline;
 
