@@ -106,8 +106,14 @@ impl Optimizer {
 			let dx = rng.gen_range(-64..=64);
 			let dy = rng.gen_range(-64..=64);
 
-			s.x = s.x.saturating_add_signed(dx).min(Pipeline::WIDTH as u16);
-			s.y = s.y.saturating_add_signed(dy).min(Pipeline::HEIGHT as u16);
+			s.x = s
+				.x
+				.saturating_add_signed(dx)
+				.min(Pipeline::WIDTH as u16 - 1);
+			s.y = s
+				.y
+				.saturating_add_signed(dy)
+				.min(Pipeline::HEIGHT as u16 - 1);
 
 			// change the width and height up to 16 pixels
 			let dw = rng.gen_range(-16..=16);
