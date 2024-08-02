@@ -1,10 +1,12 @@
 // Source texture, likely 512x512, that we want to match closely
 @group(0) @binding(0) var t_source: texture_2d<f32>;
+// A heatmap used to weigh the importance of each pixel, from 1 to 21.
+@group(0) @binding(1) var t_heatmap: texture_2d<i32>;
 
 // A bunch of bytes that represent the ellipses we want to draw
 // These are just in a big buffer, since they don't correlate to
 // the size of the image.
-@group(0) @binding(1) var<storage, read_write> ellipses: array<u32>;
+@group(0) @binding(2) var<storage, read_write> ellipses: array<u32>;
 
 const TAU: f32 = 6.283185307179586;
 
@@ -66,11 +68,11 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
 	return vec4<f32>(col / 255.0, 1.0);
 }
 
-@group(0) @binding(2)
+@group(0) @binding(3)
 var<storage, read_write> similarity: atomic<u32>;
 
 // The current texture we have, same size as the source
-@group(0) @binding(3) var t_current: texture_2d<f32>;
+@group(0) @binding(4) var t_current: texture_2d<f32>;
 
 // A compute shader that calculates how close `t_current` is to `t_source`
 // then randomly modifies part of `ellipses` to try and get closer.
@@ -88,9 +90,9 @@ fn cs_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 			let source = vec4<i32>(textureLoad(t_source, vec2<u32>(x, y), 0) * 255.0);
 			let current = vec4<i32>(textureLoad(t_current, vec2<u32>(x, y), 0) * 255.0);
 
-			let diff = abs(source - current);
+			let diff = abs(source - current) * textureLoad(t_heatmap, vec2<u32>(x, y), 0).r;
 
-			// we don't normalize as 512x512x3x256 still fits within a u32
+			// we don't normalize as 512x512x3x256*WEIGHT still fits within a u32
 			atomicAdd(&similarity, u32(diff.r + diff.g + diff.b));
 		}
 	}

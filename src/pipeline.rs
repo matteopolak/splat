@@ -24,6 +24,11 @@ pub struct Pipeline {
 	difference: wgpu::Buffer,
 	difference_staging: wgpu::Buffer,
 
+	/// The difference is multiplied by this constant (computed once)
+	/// to adjust it to be between 0 and 512*512*3*255. This is essentially
+	/// the average heatmap value, inverted.
+	difference_factor: f64,
+
 	bind_group: wgpu::BindGroup,
 	rng: rand::rngs::ThreadRng,
 
@@ -51,7 +56,12 @@ impl Pipeline {
 	/// Updates the target texture to a scaled version of the current image.
 	pub fn update_target_texture(&mut self) {
 		let image = self.optimizer.current();
-		let target = create_target_texture(&self.device, &self.queue, image);
+		let target = create_target_texture(
+			&self.device,
+			&self.queue,
+			image,
+			wgpu::TextureFormat::Rgba8Unorm,
+		);
 
 		let mut encoder = self
 			.device
@@ -98,8 +108,10 @@ impl Pipeline {
 		splats: Option<Box<[u8]>>,
 	) -> Option<Self> {
 		let optimizer = Optimizer::from_image(image);
+		let heatmap = optimizer.heatmap().to_image();
+		let difference_factor = optimizer.heatmap().average_weight().recip();
 
-		optimizer.heatmap().to_image().save("heatmap.png").unwrap();
+		heatmap.save("heatmap.png").unwrap();
 
 		let mut rng = rand::thread_rng();
 		let splats = if let Some(splats) = splats {
@@ -121,7 +133,14 @@ impl Pipeline {
 
 		let module = device.create_shader_module(wgpu::include_wgsl!("../shader.wgsl"));
 
-		let target = create_target_texture(&device, &queue, optimizer.current());
+		let target = create_target_texture(
+			&device,
+			&queue,
+			optimizer.current(),
+			wgpu::TextureFormat::Rgba8Unorm,
+		);
+		let heatmap = create_target_texture(&device, &queue, &heatmap, wgpu::TextureFormat::Rgba8Sint);
+
 		let (current, current_for_compute) =
 			create_render_textures(&device, &queue, optimizer.current());
 
@@ -134,6 +153,7 @@ impl Pipeline {
 			&device,
 			&layout,
 			&target,
+			&heatmap,
 			&splat_buffer,
 			&difference,
 			&current_for_compute,
@@ -147,6 +167,8 @@ impl Pipeline {
 			usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
 			mapped_at_creation: false,
 		});
+
+		tracing::info!("difference factor: {}", difference_factor);
 
 		Some(Self {
 			device,
@@ -167,6 +189,7 @@ impl Pipeline {
 
 			target_view: target.create_view(&wgpu::TextureViewDescriptor::default()),
 			target,
+			difference_factor,
 		})
 	}
 
@@ -333,7 +356,7 @@ impl Pipeline {
 			drop(data);
 			self.difference_staging.unmap();
 
-			difference
+			(difference as f64 * self.difference_factor) as u32
 		} else {
 			panic!("failed to run compute on gpu!")
 		}
@@ -453,6 +476,7 @@ fn bind_group(
 	device: &wgpu::Device,
 	layout: &wgpu::BindGroupLayout,
 	target_texture: &wgpu::Texture,
+	heatmap_texture: &wgpu::Texture,
 	current_params_buffer: &wgpu::Buffer,
 	difference_buffer: &wgpu::Buffer,
 	current_texture_for_compute: &wgpu::Texture,
@@ -467,9 +491,16 @@ fn bind_group(
 					&target_texture.create_view(&wgpu::TextureViewDescriptor::default()),
 				),
 			},
-			// current parameters
+			// heatmap
 			wgpu::BindGroupEntry {
 				binding: 1,
+				resource: wgpu::BindingResource::TextureView(
+					&heatmap_texture.create_view(&wgpu::TextureViewDescriptor::default()),
+				),
+			},
+			// current parameters
+			wgpu::BindGroupEntry {
+				binding: 2,
 				resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
 					buffer: current_params_buffer,
 					offset: 0,
@@ -478,7 +509,7 @@ fn bind_group(
 			},
 			// similarity buffer
 			wgpu::BindGroupEntry {
-				binding: 2,
+				binding: 3,
 				resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
 					buffer: difference_buffer,
 					offset: 0,
@@ -487,7 +518,7 @@ fn bind_group(
 			},
 			// current texture
 			wgpu::BindGroupEntry {
-				binding: 3,
+				binding: 4,
 				resource: wgpu::BindingResource::TextureView(
 					&current_texture_for_compute.create_view(&wgpu::TextureViewDescriptor::default()),
 				),
@@ -512,9 +543,20 @@ fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 				},
 				count: None,
 			},
-			// current parameters
+			// heatmap
 			wgpu::BindGroupLayoutEntry {
 				binding: 1,
+				visibility: wgpu::ShaderStages::COMPUTE,
+				ty: wgpu::BindingType::Texture {
+					sample_type: wgpu::TextureSampleType::Sint,
+					view_dimension: wgpu::TextureViewDimension::D2,
+					multisampled: false,
+				},
+				count: None,
+			},
+			// current parameters
+			wgpu::BindGroupLayoutEntry {
+				binding: 2,
 				visibility: wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::VERTEX_FRAGMENT,
 				ty: wgpu::BindingType::Buffer {
 					ty: wgpu::BufferBindingType::Storage { read_only: false },
@@ -525,7 +567,7 @@ fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 			},
 			// similarity buffer
 			wgpu::BindGroupLayoutEntry {
-				binding: 2,
+				binding: 3,
 				visibility: wgpu::ShaderStages::COMPUTE,
 				ty: wgpu::BindingType::Buffer {
 					ty: wgpu::BufferBindingType::Storage { read_only: false },
@@ -536,7 +578,7 @@ fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 			},
 			// current texture (the one being rendered to)
 			wgpu::BindGroupLayoutEntry {
-				binding: 3,
+				binding: 4,
 				visibility: wgpu::ShaderStages::COMPUTE,
 				ty: wgpu::BindingType::Texture {
 					sample_type: wgpu::TextureSampleType::Float { filterable: false },
@@ -556,9 +598,10 @@ fn create_target_texture(
 	device: &wgpu::Device,
 	queue: &wgpu::Queue,
 	image: &[u8],
+	format: wgpu::TextureFormat,
 ) -> wgpu::Texture {
 	let target_texture_desc = wgpu::TextureDescriptor {
-		label: Some("target texture (what we want)"),
+		label: None,
 		size: wgpu::Extent3d {
 			width: Pipeline::WIDTH as u32,
 			height: Pipeline::HEIGHT as u32,
@@ -567,11 +610,11 @@ fn create_target_texture(
 		mip_level_count: 1,
 		sample_count: 1,
 		dimension: wgpu::TextureDimension::D2,
-		format: wgpu::TextureFormat::Rgba8Unorm,
+		format,
 		usage: wgpu::TextureUsages::TEXTURE_BINDING
 			| wgpu::TextureUsages::COPY_DST
 			| wgpu::TextureUsages::COPY_SRC,
-		view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
+		view_formats: &[format],
 	};
 
 	device.create_texture_with_data(
@@ -679,7 +722,7 @@ fn create_difference_buffer(device: &wgpu::Device) -> (wgpu::Buffer, wgpu::Buffe
 
 	let difference_buffer_staging = device.create_buffer(&wgpu::BufferDescriptor {
 		label: None,
-		size: 4,
+		size: 8,
 		usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
 		mapped_at_creation: false,
 	});

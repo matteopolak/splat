@@ -262,6 +262,10 @@ impl HeatMap {
 		(x, y)
 	}
 
+	pub fn average_weight(&self) -> f64 {
+		self.weights_sum as f64 / self.weights.len() as f64
+	}
+
 	/// Determines a reasonable splat count based on the average complexity of the
 	/// heatmap.
 	///
@@ -286,16 +290,15 @@ impl HeatMap {
 
 	/// Constructs a heatmap image from the heatmap.
 	/// with red indicating high complexity and blue indicating low complexity.
-	pub fn to_image(&self) -> image::RgbImage {
+	pub fn to_image(&self) -> image::RgbaImage {
 		let (width, height) = self.dimensions;
-		let mut image = image::RgbImage::new(width, height);
+		let mut image = image::RgbaImage::new(width, height);
 
 		for (i, &complexity) in self.weights.iter().enumerate() {
 			let x = i as u32 % self.dimensions.0;
 			let y = i as u32 / self.dimensions.0;
 
-			let value = (complexity as f64 / u8::MAX as f64 * 255.0) as u8;
-			let pixel = image::Rgb([value, 0, 255 - value]);
+			let pixel = image::Rgba([complexity, 0, 255 - complexity, 255]);
 
 			image.put_pixel(x, y, pixel);
 		}
@@ -304,7 +307,7 @@ impl HeatMap {
 	}
 
 	pub fn from_image(image: &image::RgbaImage) -> Self {
-		let radius = 32;
+		let radius = 2;
 		let mut heatmap = vec![0; image.width() as usize * image.height() as usize];
 
 		let mut min = u32::MAX;
@@ -364,7 +367,9 @@ impl HeatMap {
 			weights: heatmap
 				.into_iter()
 				.map(|value| (value - min) as f64 / (max - min) as f64 * u8::MAX as f64)
-				.map(|value| value.clamp(32.0, 64.0))
+				// NOTE: 21 was chosen as 512*512*3*256*21 < u32::MAX
+				// this clamp must result in something between 0 and 21.4
+				.map(|value| value.clamp(8.0, 16.0))
 				.map(|value| {
 					map_sum += value as u32;
 					value as u8
